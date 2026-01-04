@@ -14,36 +14,6 @@ logger = logging.getLogger(__name__)
 
 DATA_FILE = 'vinted_data.json'
 
-# ========================================
-# 🔒 CONFIGURAZIONE ACCESSO PRIVATO
-# ========================================
-# Inserisci qui gli ID Telegram degli utenti autorizzati
-# Per trovare il tuo ID: scrivi al bot @userinfobot su Telegram
-ALLOWED_USER_IDS = [
-    123456789,  # Sostituisci con il tuo ID
-    987654321,  # Aggiungi altri ID se necessario
-]
-# ========================================
-
-def is_user_allowed(user_id: int) -> bool:
-    """Verifica se l'utente è autorizzato"""
-    return user_id in ALLOWED_USER_IDS
-
-async def check_authorization(update: Update) -> bool:
-    """Controlla autorizzazione e risponde se non autorizzato"""
-    user_id = update.effective_user.id
-    if not is_user_allowed(user_id):
-        await update.message.reply_text(
-            "🚫 <b>Accesso Negato</b>\n\n"
-            "Questo bot è privato.\n"
-            f"Il tuo ID: <code>{user_id}</code>\n\n"
-            "Contatta l'amministratore per richiedere l'accesso.",
-            parse_mode='HTML'
-        )
-        logger.warning(f"❌ Tentativo accesso non autorizzato da user_id: {user_id}")
-        return False
-    return True
-
 class VintedMonitor:
     def __init__(self):
         self.data = self.load_data()
@@ -96,6 +66,44 @@ class VintedMonitor:
     def get_user_links(self, user_id):
         user_id = str(user_id)
         return self.data['users'].get(user_id, {}).get('links', {})
+    
+    def extract_price(self, text):
+        """Estrae il prezzo in tutti i formati possibili"""
+        # Pulisci il testo
+        text = text.replace('\n', ' ').replace('\r', ' ')
+        
+        # Pattern multipli per catturare OGNI formato di prezzo
+        patterns = [
+            r'€\s*(\d+[,.]?\d*)',                    # €250.00 o €250,00
+            r'(\d+[,.]?\d*)\s*€',                    # 250.00€ o 250,00€  
+            r'(\d+[,.]?\d*)\s*EUR',                  # 250.00 EUR
+            r'EUR\s*(\d+[,.]?\d*)',                  # EUR 250.00
+            r'[Pp]rice[:\s]+(\d+[,.]?\d*)',          # Price: 250.00
+            r'[Pp]rezzo[:\s]+(\d+[,.]?\d*)',         # Prezzo: 250.00
+            r'[Cc]ost[oa][:\s]+(\d+[,.]?\d*)',       # Costa: 250.00
+            r'(\d+[,.]?\d*)\s*euro',                 # 250 euro
+            r'include.*?(\d+[,.]?\d*)',              # include...250
+        ]
+        
+        all_prices = []
+        
+        for pattern in patterns:
+            matches = re.finditer(pattern, text, re.IGNORECASE)
+            for match in matches:
+                price_str = match.group(1).replace(',', '.')
+                try:
+                    price_val = float(price_str)
+                    if 0.01 <= price_val <= 99999:
+                        all_prices.append(price_val)
+                except:
+                    continue
+        
+        if all_prices:
+            # Prendi il prezzo più alto (di solito è quello con Protezione)
+            # oppure se c'è solo uno, quello
+            return f"{max(all_prices):.2f}"
+        
+        return None
     
     def fetch_vinted_items(self, url):
         try:
@@ -152,7 +160,7 @@ class VintedMonitor:
                     if not container:
                         container = link
                     
-                    # Estrai tutto il testo del container
+                    # Estrai tutto il testo del container E della descrizione
                     full_text = container.get_text(separator=' ')
                     
                     # Cerca anche nel titolo completo e descrizione
@@ -164,14 +172,14 @@ class VintedMonitor:
                     if desc_elem:
                         full_text += ' ' + desc_elem.get_text()
                     
-                    # Titolo - AUMENTATO LIMITE CARATTERI
+                    # Titolo
                     title = link.get('title') or link.get_text(strip=True) or "Articolo"
                     if len(title) < 5 or title.isdigit():
                         # Cerca nel container escludendo numeri isolati
                         for elem in container.find_all(['div', 'p', 'span', 'h2', 'h3', 'h4']):
                             txt = elem.get_text(strip=True)
-                            if 10 < len(txt) < 300 and not txt.replace(' ','').isdigit():
-                                # Escludi se sembra un prezzo isolato
+                            if 10 < len(txt) < 150 and not txt.replace(' ','').isdigit():
+                                # Escludi se sembra un prezzo
                                 if not re.search(r'^\d+[,.]?\d*\s*€', txt):
                                     title = txt
                                     break
@@ -193,16 +201,17 @@ class VintedMonitor:
                         if photo and ('placeholder' in photo or 'data:image' in photo):
                             photo = img.get('data-src') or img.get('data-lazy-src')
                     
-                    # Aggiungi solo se ha titolo valido
-                    if title != "Articolo" and len(title) > 5:
+                    # Aggiungi solo se ha almeno titolo O prezzo
+                    if (title != "Articolo" and len(title) > 5) or price:
                         items.append({
                             'id': item_id,
-                            'title': title[:300],  # AUMENTATO DA 120 A 300
-                            'price': price,  # Può essere None
+                            'title': title[:120],
+                            'price': price or "N/D",
+                            'currency': '€',
                             'url': url,
                             'photo': photo
                         })
-                        logger.info(f"  ✓ {title[:60]} - {price or 'prezzo N/D'}€")
+                        logger.info(f"  ✓ {title[:40]} - {price or 'N/D'}€")
                 except Exception as e:
                     logger.error(f"  ✗ Errore parsing item: {e}")
                     continue
@@ -226,21 +235,19 @@ class VintedMonitor:
                     if not isinstance(item, dict) or 'id' not in item:
                         continue
                     
+                    price = str(item.get('price', '0'))
+                    if 'total_item_price' in item:
+                        price = str(item['total_item_price'])
+                    
                     photo = None
                     if 'photo' in item and isinstance(item['photo'], dict):
                         photo = item['photo'].get('url')
                     
-                    # Estrai prezzo
-                    price = None
-                    if 'price' in item:
-                        price = str(item.get('price', ''))
-                    if 'total_item_price' in item:
-                        price = str(item['total_item_price'])
-                    
                     items.append({
                         'id': str(item['id']),
-                        'title': item.get('title', 'Articolo')[:300],  # AUMENTATO A 300
-                        'price': price,  # Può essere None
+                        'title': item.get('title', 'Articolo')[:120],
+                        'price': price,
+                        'currency': item.get('currency', '€'),
                         'url': item.get('url', f"https://www.vinted.it/items/{item['id']}"),
                         'photo': photo
                     })
@@ -292,9 +299,6 @@ class VintedMonitor:
 monitor = VintedMonitor()
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await check_authorization(update):
-        return
-    
     await update.message.reply_text(
         "🛍️ <b>Benvenuto su Vinted Alert Bot!</b>\n\n"
         "🔔 Ti avviso quando compaiono nuovi articoli!\n\n"
@@ -311,9 +315,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def aggiungi(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await check_authorization(update):
-        return
-    
     await update.message.reply_text(
         "🔗 <b>Aggiungi un nuovo link</b>\n\n"
         "Copia il link da Vinted e inviamelo insieme al nome:\n\n"
@@ -325,9 +326,6 @@ async def aggiungi(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def lista(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await check_authorization(update):
-        return
-    
     links = monitor.get_user_links(update.effective_user.id)
     if not links:
         await update.message.reply_text(
@@ -353,9 +351,6 @@ async def lista(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(msg, parse_mode='HTML')
 
 async def test_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await check_authorization(update):
-        return
-    
     links = monitor.get_user_links(update.effective_user.id)
     if not links:
         await update.message.reply_text("📭 Nessun link da testare")
@@ -375,13 +370,9 @@ async def test_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             
             for i, item in enumerate(items[:5], 1):
-                caption = f"<b>{item['title']}</b>\n\n"
-                
-                # Mostra prezzo SOLO se trovato
-                if item.get('price'):
-                    caption += f"💰 <b>Prezzo:</b> {item['price']} €\n"
-                
-                caption += (
+                caption = (
+                    f"<b>{item['title']}</b>\n\n"
+                    f"💰 <b>Prezzo:</b> {item['price']} €\n"
                     f"🔗 <a href='{item['url']}'>Vedi su Vinted</a>\n"
                     f"━━━━━━━━━━━━━━━━━━━━\n"
                     f"📍 Articolo {i} di {min(5, len(items))}"
@@ -403,9 +394,6 @@ async def test_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
 
 async def rimuovi(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await check_authorization(update):
-        return
-    
     links = monitor.get_user_links(update.effective_user.id)
     if not links:
         await update.message.reply_text("📭 Nessun link")
@@ -421,9 +409,6 @@ async def rimuovi(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await check_authorization(update):
-        return
-    
     text = update.message.text
     user_id = update.effective_user.id
     
@@ -457,13 +442,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             
             if items:
                 for i, item in enumerate(items[:3], 1):
-                    caption = f"<b>{item['title']}</b>\n\n"
-                    
-                    # Mostra prezzo SOLO se trovato
-                    if item.get('price'):
-                        caption += f"💰 <b>Prezzo:</b> {item['price']} €\n"
-                    
-                    caption += f"🔗 <a href='{item['url']}'>Vedi su Vinted</a>"
+                    caption = (
+                        f"<b>{item['title']}</b>\n\n"
+                        f"💰 <b>Prezzo:</b> {item['price']} €\n"
+                        f"🔗 <a href='{item['url']}'>Vedi su Vinted</a>"
+                    )
                     
                     try:
                         if item['photo'] and 'http' in item['photo']:
@@ -517,14 +500,6 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     
-    # Verifica autorizzazione anche per i callback
-    if not is_user_allowed(query.from_user.id):
-        await query.edit_message_text(
-            "🚫 <b>Accesso Negato</b>",
-            parse_mode='HTML'
-        )
-        return
-    
     if query.data == 'cancel':
         await query.edit_message_text("❌ <b>Operazione annullata</b>", parse_mode='HTML')
         context.user_data.clear()
@@ -554,13 +529,11 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         if items:
             for i, item in enumerate(items[:3], 1):
-                caption = f"<b>{item['title']}</b>\n\n"
-                
-                # Mostra prezzo SOLO se trovato
-                if item.get('price'):
-                    caption += f"💰 <b>Prezzo:</b> {item['price']} €\n"
-                
-                caption += f"🔗 <a href='{item['url']}'>Vedi</a>"
+                caption = (
+                    f"<b>{item['title']}</b>\n\n"
+                    f"💰 <b>Prezzo:</b> {item['price']} €\n"
+                    f"🔗 <a href='{item['url']}'>Vedi</a>"
+                )
                 
                 try:
                     if item['photo'] and 'http' in item['photo']:
@@ -588,10 +561,6 @@ async def check_updates(context: ContextTypes.DEFAULT_TYPE):
     current_time = datetime.now()
     
     for uid, udata in monitor.data['users'].items():
-        # Verifica che l'utente sia ancora autorizzato
-        if not is_user_allowed(int(uid)):
-            continue
-        
         for lid, ldata in udata['links'].items():
             try:
                 # Controlla se è ora di fare il check per questo link
@@ -608,13 +577,10 @@ async def check_updates(context: ContextTypes.DEFAULT_TYPE):
                 new = monitor.check_new_items(uid, lid)
                 
                 for item in new:
-                    caption = f"🆕 <b>NUOVO ARTICOLO TROVATO!</b>\n\n<b>{item['title']}</b>\n\n"
-                    
-                    # Mostra prezzo SOLO se trovato
-                    if item.get('price'):
-                        caption += f"💰 <b>Prezzo:</b> {item['price']} €\n"
-                    
-                    caption += (
+                    caption = (
+                        f"🆕 <b>NUOVO ARTICOLO TROVATO!</b>\n\n"
+                        f"<b>{item['title']}</b>\n\n"
+                        f"💰 <b>Prezzo:</b> {item['price']} €\n"
                         f"🔗 <a href='{item['url']}'>Vedi su Vinted</a>\n\n"
                         f"━━━━━━━━━━━━━━━━━━━━\n"
                         f"📋 Ricerca: <i>{ldata['name']}</i>"
@@ -647,10 +613,6 @@ def main():
         logger.error("❌ TELEGRAM_BOT_TOKEN mancante!")
         return
     
-    if not ALLOWED_USER_IDS or ALLOWED_USER_IDS == [123456789, 987654321]:
-        logger.warning("⚠️ ATTENZIONE: Modifica ALLOWED_USER_IDS con i tuoi ID Telegram reali!")
-        logger.warning("⚠️ Per trovare il tuo ID scrivi a @userinfobot su Telegram")
-    
     app = Application.builder().token(TOKEN).build()
     
     app.add_handler(CommandHandler("start", start))
@@ -661,12 +623,11 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(CallbackQueryHandler(button_callback))
     
-    # Controllo ogni 1 MINUTO
+    # Controllo ogni 1 MINUTO (il bot controllerà ogni link in base al suo intervallo)
     app.job_queue.run_repeating(check_updates, interval=60, first=10)
     
     logger.info("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
     logger.info("🚀 BOT VINTED AVVIATO!")
-    logger.info(f"🔒 Modalità PRIVATA - {len(ALLOWED_USER_IDS)} utenti autorizzati")
     logger.info("⏱️  Controllo personalizzato per ogni link")
     logger.info("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
     
