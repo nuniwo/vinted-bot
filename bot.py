@@ -1,14 +1,11 @@
 import os
 import json
-import time
 import asyncio
 import logging
 from datetime import datetime
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters
 import requests
-from bs4 import BeautifulSoup
-import re
 from urllib.parse import urlparse, parse_qs, urlencode
 
 # Configurazione logging
@@ -26,14 +23,11 @@ class VintedMonitor:
         self.data = self.load_data()
         self.session = requests.Session()
         self.session.headers.update({
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-            'Accept-Language': 'it-IT,it;q=0.9,en-US;q=0.8,en;q=0.7',
-            'Accept-Encoding': 'gzip, deflate, br',
-            'DNT': '1',
-            'Connection': 'keep-alive',
-            'Upgrade-Insecure-Requests': '1',
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            'Accept': 'application/json, text/plain, */*',
+            'Accept-Language': 'it-IT,it;q=0.9',
         })
+        self.api_base = 'https://www.vinted.it/api/v2'
     
     def load_data(self):
         """Carica i dati dal file JSON"""
@@ -82,170 +76,120 @@ class VintedMonitor:
             return self.data['users'][user_id]['links']
         return {}
     
-    def normalize_url(self, url):
-        """Normalizza l'URL per assicurarsi che sia corretto"""
-        url = url.strip()
-        if not url.startswith('http'):
-            url = 'https://' + url
-        if 'vinted.it' in url and 'www.vinted.it' not in url:
-            url = url.replace('vinted.it', 'www.vinted.it')
-        url = url.replace('www.www.', 'www.')
-        return url
-    
-    def find_items_recursive(self, obj, depth=0, max_depth=10):
-        """Cerca ricorsivamente un array 'items' nel JSON"""
-        if depth > max_depth:
-            return None
+    def parse_vinted_url(self, url):
+        """Estrae i parametri dalla URL di Vinted"""
+        parsed = urlparse(url)
+        params = parse_qs(parsed.query)
         
-        if isinstance(obj, dict):
-            if 'items' in obj and isinstance(obj['items'], list):
-                if len(obj['items']) > 0 and isinstance(obj['items'][0], dict):
-                    if 'id' in obj['items'][0] and 'title' in obj['items'][0]:
-                        return obj['items']
-            for value in obj.values():
-                result = self.find_items_recursive(value, depth + 1, max_depth)
-                if result:
-                    return result
-        elif isinstance(obj, list):
-            for item in obj:
-                result = self.find_items_recursive(item, depth + 1, max_depth)
-                if result:
-                    return result
-        return None
+        # Converti liste in valori singoli
+        clean_params = {}
+        for key, value in params.items():
+            if isinstance(value, list) and len(value) > 0:
+                clean_params[key] = value[0]
+            else:
+                clean_params[key] = value
+        
+        return clean_params
     
     def fetch_vinted_items(self, url):
-        """Recupera gli articoli da Vinted tramite scraping HTML"""
+        """Recupera gli articoli da Vinted usando l'API"""
         try:
-            url = self.normalize_url(url)
-            logger.info(f"🔍 Fetching URL: {url[:150]}...")
+            logger.info(f"🔍 Fetching URL: {url[:100]}...")
             
-            response = self.session.get(url, timeout=20, allow_redirects=True)
+            # Estrai parametri dalla URL
+            params = self.parse_vinted_url(url)
+            
+            # Costruisci URL API
+            api_url = f"{self.api_base}/catalog/items"
+            
+            # Parametri comuni
+            api_params = {
+                'page': '1',
+                'per_page': '20',
+            }
+            
+            # Aggiungi parametri dalla ricerca originale
+            if 'search_text' in params:
+                api_params['search_text'] = params['search_text']
+            if 'catalog_ids' in params:
+                api_params['catalog_ids'] = params['catalog_ids']
+            if 'brand_ids' in params:
+                api_params['brand_ids'] = params['brand_ids']
+            if 'size_ids' in params:
+                api_params['size_ids'] = params['size_ids']
+            if 'price_from' in params:
+                api_params['price_from'] = params['price_from']
+            if 'price_to' in params:
+                api_params['price_to'] = params['price_to']
+            if 'currency' in params:
+                api_params['currency'] = params['currency']
+            if 'order' in params:
+                api_params['order'] = params['order']
+            
+            logger.info(f"📡 API URL: {api_url}")
+            logger.info(f"📋 Parametri: {api_params}")
+            
+            # Fai la richiesta
+            response = self.session.get(api_url, params=api_params, timeout=15)
             logger.info(f"📊 Status: {response.status_code}")
             
             if response.status_code != 200:
                 logger.error(f"❌ HTTP {response.status_code}")
+                logger.error(f"Response: {response.text[:200]}")
                 return []
             
-            soup = BeautifulSoup(response.text, 'html.parser')
+            data = response.json()
+            
+            if 'items' not in data:
+                logger.warning("⚠️ Nessun campo 'items' nella risposta")
+                logger.info(f"Chiavi disponibili: {list(data.keys())}")
+                return []
+            
+            items_data = data['items']
+            logger.info(f"📦 Trovati {len(items_data)} articoli")
+            
             items = []
-            scripts = soup.find_all('script')
-            logger.info(f"📜 Trovati {len(scripts)} script tags")
+            for item in items_data:
+                # Estrai foto
+                photo_url = None
+                if 'photo' in item and item['photo']:
+                    photo_url = item['photo'].get('url') or item['photo'].get('full_size_url')
+                
+                # Prezzo
+                price = '0'
+                currency = '€'
+                if 'price' in item:
+                    price = item['price']
+                if 'currency' in item:
+                    currency = item['currency']
+                
+                # URL articolo
+                item_url = item.get('url', f"https://www.vinted.it/items/{item['id']}")
+                if not item_url.startswith('http'):
+                    item_url = 'https://www.vinted.it' + item_url
+                
+                items.append({
+                    'id': str(item['id']),
+                    'title': item.get('title', 'Senza titolo'),
+                    'price': str(price),
+                    'currency': currency,
+                    'url': item_url,
+                    'photo': photo_url
+                })
             
-            for idx, script in enumerate(scripts):
-                if not script.string:
-                    continue
-                
-                script_content = script.string.strip()
-                
-                # Cerca solo script che iniziano con window.__
-                if not script_content.startswith('window.__'):
-                    continue
-                
-                logger.info(f"🎯 Script #{idx} inizia con window.__ - analizzo")
-                
-                # Cerca il nome della variabile
-                var_match = re.match(r'window\.__(\w+)__\s*=\s*', script_content)
-                if not var_match:
-                    continue
-                
-                var_name = var_match.group(1)
-                logger.info(f"📦 Variabile trovata: window.__{var_name}__")
-                
-                # Estrai tutto dopo l'uguale fino al punto e virgola finale
-                try:
-                    # Trova la posizione del primo '{'
-                    start_pos = script_content.index('{')
-                    # Prendi tutto da lì fino alla fine (meno eventuale ;)
-                    json_str = script_content[start_pos:].rstrip(';').strip()
-                    
-                    logger.info(f"🔄 Tento parsing JSON (lunghezza: {len(json_str)} char)...")
-                    
-                    # Prova a parsare
-                    data = json.loads(json_str)
-                    logger.info(f"✅ JSON parsato! Chiavi top: {list(data.keys())[:10]}")
-                    
-                    # Cerca items
-                    items_data = None
-                    
-                    # Metodo 1: catalog.items
-                    if 'catalog' in data and isinstance(data['catalog'], dict):
-                        if 'items' in data['catalog']:
-                            items_data = data['catalog']['items']
-                            logger.info(f"✅ Trovati {len(items_data)} items in catalog.items")
-                    
-                    # Metodo 2: items diretti
-                    if not items_data and 'items' in data:
-                        items_data = data['items']
-                        logger.info(f"✅ Trovati {len(items_data)} items diretti")
-                    
-                    # Metodo 3: ricerca ricorsiva
-                    if not items_data:
-                        logger.info("🔍 Cerco items ricorsivamente...")
-                        items_data = self.find_items_recursive(data)
-                        if items_data:
-                            logger.info(f"✅ Trovati {len(items_data)} items ricorsivamente!")
-                    
-                    if items_data and isinstance(items_data, list) and len(items_data) > 0:
-                        logger.info(f"📦 Processando {len(items_data)} items...")
-                        
-                        for item in items_data:
-                            if not isinstance(item, dict):
-                                continue
-                            
-                            item_id = item.get('id')
-                            if not item_id:
-                                continue
-                            
-                            # Estrai foto
-                            photo_url = None
-                            if 'photo' in item and item['photo']:
-                                if isinstance(item['photo'], dict):
-                                    photo_url = item['photo'].get('url') or item['photo'].get('full_size_url')
-                            
-                            if 'photos' in item and item['photos'] and len(item['photos']) > 0:
-                                first_photo = item['photos'][0]
-                                if isinstance(first_photo, dict):
-                                    photo_url = first_photo.get('url') or first_photo.get('full_size_url')
-                            
-                            # URL articolo
-                            item_url = item.get('url', f"https://www.vinted.it/items/{item_id}")
-                            if not item_url.startswith('http'):
-                                item_url = 'https://www.vinted.it' + item_url
-                            
-                            items.append({
-                                'id': str(item_id),
-                                'title': item.get('title', 'Senza titolo'),
-                                'price': str(item.get('price', '0')),
-                                'currency': item.get('currency', '€'),
-                                'url': item_url,
-                                'photo': photo_url
-                            })
-                        
-                        if items:
-                            logger.info(f"✅ Estratti {len(items)} articoli totali!")
-                            return items[:20]
-                
-                except ValueError as e:
-                    logger.warning(f"⚠️ Errore nel trovare {{ nell'script")
-                    continue
-                except json.JSONDecodeError as e:
-                    logger.warning(f"⚠️ JSON decode error: {str(e)[:100]}")
-                    continue
-                except Exception as e:
-                    logger.error(f"⚠️ Errore: {str(e)[:100]}")
-                    continue
-            
-            if not items:
-                logger.warning("❌ Nessun articolo estratto da tutti gli script")
-                logger.info("💡 Vinted potrebbe aver cambiato la struttura della pagina")
-            
+            logger.info(f"✅ Estratti {len(items)} articoli!")
             return items
             
         except requests.RequestException as e:
-            logger.error(f"❌ Errore connessione: {str(e)[:200]}")
+            logger.error(f"❌ Errore connessione: {str(e)}")
+            return []
+        except json.JSONDecodeError as e:
+            logger.error(f"❌ Errore parsing JSON: {str(e)}")
             return []
         except Exception as e:
-            logger.error(f"❌ Errore generale: {str(e)[:200]}")
+            logger.error(f"❌ Errore generale: {str(e)}")
+            import traceback
+            logger.error(traceback.format_exc())
             return []
     
     def check_new_items(self, user_id, link_id):
@@ -421,7 +365,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not test_items:
             await update.message.reply_text(
                 "❌ <b>Nessun articolo trovato</b>\n\n"
-                "Assicurati di copiare l'URL completo!",
+                "Assicurati di copiare l'URL completo dalla barra degli indirizzi!\n\n"
+                "💡 Deve essere tipo:\n"
+                "<code>https://www.vinted.it/catalog?search_text=...</code>",
                 parse_mode='HTML'
             )
             return
@@ -494,14 +440,16 @@ async def check_updates(context: ContextTypes.DEFAULT_TYPE):
                                 text=message,
                                 parse_mode='HTML'
                             )
-                        logger.info(f"✅ Notifica inviata")
+                        logger.info(f"✅ Notifica inviata a {user_id}")
                     except Exception as e:
                         logger.error(f"❌ Errore notifica: {e}")
                 
-                await asyncio.sleep(5)
+                await asyncio.sleep(3)
                 
             except Exception as e:
                 logger.error(f"❌ Errore controllo: {e}")
+                import traceback
+                logger.error(traceback.format_exc())
     
     logger.info("✅ CONTROLLO COMPLETATO\n")
 
@@ -526,7 +474,7 @@ def main():
     job_queue = application.job_queue
     job_queue.run_repeating(check_updates, interval=300, first=10)
     
-    logger.info("🚀 BOT AVVIATO!")
+    logger.info("🚀 BOT VINTED AVVIATO CON API!")
     
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
