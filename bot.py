@@ -91,9 +91,12 @@ class VintedMonitor:
         if not url.startswith('http'):
             url = 'https://' + url
         
-        # Assicurati che sia www.vinted.it
-        url = url.replace('vinted.it/', 'www.vinted.it/')
-        url = url.replace('https://vinted.it', 'https://www.vinted.it')
+        # Fix per assicurarsi che sia www.vinted.it (evitando doppio www)
+        if 'vinted.it' in url and 'www.vinted.it' not in url:
+            url = url.replace('vinted.it', 'www.vinted.it')
+        
+        # Rimuovi eventuali doppi www
+        url = url.replace('www.www.', 'www.')
         
         return url
     
