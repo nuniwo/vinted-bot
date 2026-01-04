@@ -1,0 +1,1 @@
+worker: python goals_bot.py
