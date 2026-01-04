@@ -40,13 +40,17 @@ class VintedMonitor:
         with open(DATA_FILE, 'w') as f:
             json.dump(self.data, f, indent=2)
     
-    def add_user_link(self, user_id, link, name):
+    def add_user_link(self, user_id, link, name, interval=180):
         user_id = str(user_id)
         if user_id not in self.data['users']:
             self.data['users'][user_id] = {'links': {}}
         link_id = str(len(self.data['users'][user_id]['links']) + 1)
         self.data['users'][user_id]['links'][link_id] = {
-            'url': link, 'name': name, 'last_items': [], 'added_at': datetime.now().isoformat()
+            'url': link, 
+            'name': name, 
+            'last_items': [], 
+            'added_at': datetime.now().isoformat(),
+            'check_interval': interval
         }
         self.save_data()
         return link_id
@@ -65,26 +69,40 @@ class VintedMonitor:
     
     def extract_price(self, text):
         """Estrae il prezzo in tutti i formati possibili"""
-        # Pattern per catturare prezzi in vari formati
+        # Pulisci il testo
+        text = text.replace('\n', ' ').replace('\r', ' ')
+        
+        # Pattern multipli per catturare OGNI formato di prezzo
         patterns = [
-            r'€\s*(\d+[,.]?\d*)',           # €80.00 o €80,00
-            r'(\d+[,.]?\d*)\s*€',           # 80.00€ o 80,00€  
-            r'(\d+[,.]?\d*)\s*EUR',         # 80.00 EUR
-            r'EUR\s*(\d+[,.]?\d*)',         # EUR 80.00
-            r'Price[:\s]+(\d+[,.]?\d*)',    # Price: 80.00
-            r'Prezzo[:\s]+(\d+[,.]?\d*)',   # Prezzo: 80.00
+            r'€\s*(\d+[,.]?\d*)',                    # €250.00 o €250,00
+            r'(\d+[,.]?\d*)\s*€',                    # 250.00€ o 250,00€  
+            r'(\d+[,.]?\d*)\s*EUR',                  # 250.00 EUR
+            r'EUR\s*(\d+[,.]?\d*)',                  # EUR 250.00
+            r'[Pp]rice[:\s]+(\d+[,.]?\d*)',          # Price: 250.00
+            r'[Pp]rezzo[:\s]+(\d+[,.]?\d*)',         # Prezzo: 250.00
+            r'[Cc]ost[oa][:\s]+(\d+[,.]?\d*)',       # Costa: 250.00
+            r'(\d+[,.]?\d*)\s*euro',                 # 250 euro
+            r'include.*?(\d+[,.]?\d*)',              # include...250
         ]
         
+        all_prices = []
+        
         for pattern in patterns:
-            match = re.search(pattern, text, re.IGNORECASE)
-            if match:
+            matches = re.finditer(pattern, text, re.IGNORECASE)
+            for match in matches:
                 price_str = match.group(1).replace(',', '.')
                 try:
                     price_val = float(price_str)
-                    if 0.01 <= price_val <= 99999:  # Range ragionevole
-                        return f"{price_val:.2f}"
+                    if 0.01 <= price_val <= 99999:
+                        all_prices.append(price_val)
                 except:
                     continue
+        
+        if all_prices:
+            # Prendi il prezzo più alto (di solito è quello con Protezione)
+            # oppure se c'è solo uno, quello
+            return f"{max(all_prices):.2f}"
+        
         return None
     
     def fetch_vinted_items(self, url):
@@ -142,10 +160,19 @@ class VintedMonitor:
                     if not container:
                         container = link
                     
-                    # Estrai tutto il testo del container
+                    # Estrai tutto il testo del container E della descrizione
                     full_text = container.get_text(separator=' ')
                     
-                    # Titolo: cerca nel link o attributi
+                    # Cerca anche nel titolo completo e descrizione
+                    title_elem = container.find(['h1', 'h2', 'h3', 'h4'])
+                    desc_elem = container.find(['p', 'div'], class_=re.compile(r'description|desc', re.I))
+                    
+                    if title_elem:
+                        full_text += ' ' + title_elem.get_text()
+                    if desc_elem:
+                        full_text += ' ' + desc_elem.get_text()
+                    
+                    # Titolo
                     title = link.get('title') or link.get_text(strip=True) or "Articolo"
                     if len(title) < 5 or title.isdigit():
                         # Cerca nel container escludendo numeri isolati
@@ -383,22 +410,118 @@ async def rimuovi(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
+    user_id = update.effective_user.id
     
+    # Se sta aspettando l'intervallo
+    if context.user_data.get('awaiting_interval'):
+        try:
+            interval = int(text)
+            if interval < 1 or interval > 60:
+                await update.message.reply_text("❌ Inserisci un numero tra 1 e 60 minuti!")
+                return
+            
+            # Recupera i dati temporanei
+            url = context.user_data.get('temp_url')
+            name = context.user_data.get('temp_name')
+            
+            msg = await update.message.reply_text("🔍 <b>Verifico il link...</b>", parse_mode='HTML')
+            
+            items = monitor.fetch_vinted_items(url)
+            link_id = monitor.add_user_link(user_id, url, name, interval * 60)
+            
+            await msg.edit_text(
+                f"✅ <b>Link aggiunto con successo!</b>\n\n"
+                f"🏷️ <b>Nome:</b> {name}\n"
+                f"🆔 <b>ID:</b> #{link_id}\n"
+                f"📦 <b>Articoli:</b> {len(items)}\n"
+                f"⏱️ <b>Controllo ogni:</b> {interval} minuti\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"🔔 Ti avviserò per nuovi articoli!",
+                parse_mode='HTML'
+            )
+            
+            if items:
+                for i, item in enumerate(items[:3], 1):
+                    caption = (
+                        f"<b>{item['title']}</b>\n\n"
+                        f"💰 <b>Prezzo:</b> {item['price']} €\n"
+                        f"🔗 <a href='{item['url']}'>Vedi su Vinted</a>"
+                    )
+                    
+                    try:
+                        if item['photo'] and 'http' in item['photo']:
+                            await update.message.reply_photo(item['photo'], caption=caption, parse_mode='HTML')
+                        else:
+                            await update.message.reply_text(caption, parse_mode='HTML')
+                    except:
+                        await update.message.reply_text(caption, parse_mode='HTML')
+                    
+                    await asyncio.sleep(0.5)
+            
+            # Pulisci i dati temporanei
+            context.user_data.clear()
+            return
+            
+        except ValueError:
+            await update.message.reply_text("❌ Devi inviare un numero!")
+            return
+    
+    # Gestione normale del link
     if 'vinted' in text.lower():
         parts = text.split(' ', 1)
         url = parts[0]
         name = parts[1] if len(parts) > 1 else "Ricerca"
         
-        msg = await update.message.reply_text("🔍 <b>Verifico il link...</b>", parse_mode='HTML')
+        # Salva temporaneamente
+        context.user_data['temp_url'] = url
+        context.user_data['temp_name'] = name
+        context.user_data['awaiting_interval'] = True
+        
+        # Chiedi l'intervallo
+        keyboard = [
+            [InlineKeyboardButton("⚡ 1 min", callback_data='interval_1'),
+             InlineKeyboardButton("⏱️ 3 min", callback_data='interval_3')],
+            [InlineKeyboardButton("🕐 5 min", callback_data='interval_5'),
+             InlineKeyboardButton("🕐 10 min", callback_data='interval_10')],
+            [InlineKeyboardButton("🕐 30 min", callback_data='interval_30'),
+             InlineKeyboardButton("🕐 60 min", callback_data='interval_60')]
+        ]
+        
+        await update.message.reply_text(
+            f"✅ <b>Link riconosciuto!</b>\n\n"
+            f"🏷️ Nome: {name}\n\n"
+            f"⏱️ <b>Ogni quanto vuoi controllare?</b>\n"
+            f"(Scegli dai pulsanti o scrivi un numero da 1 a 60)",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode='HTML'
+        )
+
+async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    if query.data == 'cancel':
+        await query.edit_message_text("❌ <b>Operazione annullata</b>", parse_mode='HTML')
+        context.user_data.clear()
+        
+    elif query.data.startswith('interval_'):
+        # Gestisci selezione intervallo
+        interval = int(query.data.replace('interval_', ''))
+        
+        url = context.user_data.get('temp_url')
+        name = context.user_data.get('temp_name')
+        
+        await query.edit_message_text("🔍 <b>Verifico il link...</b>", parse_mode='HTML')
         
         items = monitor.fetch_vinted_items(url)
-        link_id = monitor.add_user_link(update.effective_user.id, url, name)
+        link_id = monitor.add_user_link(query.from_user.id, url, name, interval * 60)
         
-        await msg.edit_text(
+        await query.edit_message_text(
             f"✅ <b>Link aggiunto con successo!</b>\n\n"
             f"🏷️ <b>Nome:</b> {name}\n"
             f"🆔 <b>ID:</b> #{link_id}\n"
             f"📦 <b>Articoli:</b> {len(items)}\n"
+            f"⏱️ <b>Controllo ogni:</b> {interval} minuti\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"🔔 Ti avviserò per nuovi articoli!",
             parse_mode='HTML'
@@ -409,25 +532,21 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 caption = (
                     f"<b>{item['title']}</b>\n\n"
                     f"💰 <b>Prezzo:</b> {item['price']} €\n"
-                    f"🔗 <a href='{item['url']}'>Vedi su Vinted</a>"
+                    f"🔗 <a href='{item['url']}'>Vedi</a>"
                 )
                 
                 try:
                     if item['photo'] and 'http' in item['photo']:
-                        await update.message.reply_photo(item['photo'], caption=caption, parse_mode='HTML')
+                        await query.message.reply_photo(item['photo'], caption=caption, parse_mode='HTML')
                     else:
-                        await update.message.reply_text(caption, parse_mode='HTML')
+                        await query.message.reply_text(caption, parse_mode='HTML')
                 except:
-                    await update.message.reply_text(caption, parse_mode='HTML')
+                    await query.message.reply_text(caption, parse_mode='HTML')
                 
                 await asyncio.sleep(0.5)
-
-async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    
-    if query.data == 'cancel':
-        await query.edit_message_text("❌ <b>Operazione annullata</b>", parse_mode='HTML')
+        
+        context.user_data.clear()
+        
     elif query.data.startswith('remove_'):
         lid = query.data.replace('remove_', '')
         if monitor.remove_user_link(query.from_user.id, lid):
@@ -439,10 +558,22 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def check_updates(context: ContextTypes.DEFAULT_TYPE):
     logger.info("━━━━━━ 🔍 CONTROLLO PERIODICO ━━━━━━")
+    current_time = datetime.now()
     
     for uid, udata in monitor.data['users'].items():
         for lid, ldata in udata['links'].items():
             try:
+                # Controlla se è ora di fare il check per questo link
+                interval = ldata.get('check_interval', 180)
+                last_check = ldata.get('last_check')
+                
+                if last_check:
+                    last_dt = datetime.fromisoformat(last_check)
+                    seconds_passed = (current_time - last_dt).total_seconds()
+                    
+                    if seconds_passed < interval:
+                        continue  # Non ancora tempo
+                
                 new = monitor.check_new_items(uid, lid)
                 
                 for item in new:
@@ -492,12 +623,12 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(CallbackQueryHandler(button_callback))
     
-    # Controllo ogni 3 MINUTI (180 secondi)
-    app.job_queue.run_repeating(check_updates, interval=180, first=10)
+    # Controllo ogni 1 MINUTO (il bot controllerà ogni link in base al suo intervallo)
+    app.job_queue.run_repeating(check_updates, interval=60, first=10)
     
     logger.info("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
     logger.info("🚀 BOT VINTED AVVIATO!")
-    logger.info("⏱️  Controllo ogni 3 MINUTI")
+    logger.info("⏱️  Controllo personalizzato per ogni link")
     logger.info("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
     
     app.run_polling(allowed_updates=Update.ALL_TYPES)
