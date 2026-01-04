@@ -6,8 +6,8 @@ from datetime import datetime
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters
 import requests
-from urllib.parse import urlparse, parse_qs
-import uuid
+from bs4 import BeautifulSoup
+import re
 
 # Configurazione logging
 logging.basicConfig(
@@ -23,54 +23,25 @@ class VintedMonitor:
     def __init__(self):
         self.data = self.load_data()
         self.session = requests.Session()
-        self.api_base = 'https://www.vinted.it/api/v2'
-        self.token = None
         self._setup_session()
     
     def _setup_session(self):
-        """Configura la sessione con headers appropriati"""
+        """Configura la sessione con headers realistici"""
         self.session.headers.update({
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            'Accept': 'application/json, text/plain, */*',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
             'Accept-Language': 'it-IT,it;q=0.9,en;q=0.8',
             'Accept-Encoding': 'gzip, deflate, br',
-            'Origin': 'https://www.vinted.it',
-            'Referer': 'https://www.vinted.it/',
+            'DNT': '1',
+            'Connection': 'keep-alive',
+            'Upgrade-Insecure-Requests': '1',
+            'Sec-Fetch-Dest': 'document',
+            'Sec-Fetch-Mode': 'navigate',
+            'Sec-Fetch-Site': 'none',
+            'Cache-Control': 'max-age=0',
         })
     
-    def _get_token(self):
-        """Ottiene un token di sessione valido"""
-        try:
-            # Fai una richiesta alla homepage per ottenere i cookie di sessione
-            response = self.session.get('https://www.vinted.it', timeout=10)
-            
-            if response.status_code == 200:
-                # Cerca il token nel HTML o nei cookie
-                cookies = self.session.cookies.get_dict()
-                
-                # Vinted usa un cookie chiamato _vinted_fr_session o simile
-                for cookie_name in cookies:
-                    if 'vinted' in cookie_name.lower() and 'session' in cookie_name.lower():
-                        logger.info(f"✅ Cookie di sessione trovato: {cookie_name}")
-                
-                # Cerca anche nei meta tag o script
-                if 'csrf-token' in response.text:
-                    import re
-                    csrf_match = re.search(r'csrf-token["\']?\s*content=["\']([^"\']+)', response.text)
-                    if csrf_match:
-                        csrf_token = csrf_match.group(1)
-                        self.session.headers['X-CSRF-Token'] = csrf_token
-                        logger.info("✅ CSRF token trovato e impostato")
-                
-                return True
-            
-            return False
-        except Exception as e:
-            logger.error(f"❌ Errore ottenimento token: {e}")
-            return False
-    
     def load_data(self):
-        """Carica i dati dal file JSON"""
         if os.path.exists(DATA_FILE):
             try:
                 with open(DATA_FILE, 'r') as f:
@@ -80,12 +51,10 @@ class VintedMonitor:
         return {'users': {}}
     
     def save_data(self):
-        """Salva i dati nel file JSON"""
         with open(DATA_FILE, 'w') as f:
             json.dump(self.data, f, indent=2)
     
     def add_user_link(self, user_id, link, name):
-        """Aggiunge un link da monitorare per un utente"""
         user_id = str(user_id)
         if user_id not in self.data['users']:
             self.data['users'][user_id] = {'links': {}}
@@ -101,7 +70,6 @@ class VintedMonitor:
         return link_id
     
     def remove_user_link(self, user_id, link_id):
-        """Rimuove un link monitorato"""
         user_id = str(user_id)
         if user_id in self.data['users'] and link_id in self.data['users'][user_id]['links']:
             del self.data['users'][user_id]['links'][link_id]
@@ -110,159 +78,257 @@ class VintedMonitor:
         return False
     
     def get_user_links(self, user_id):
-        """Ottiene tutti i link di un utente"""
         user_id = str(user_id)
         if user_id in self.data['users']:
             return self.data['users'][user_id]['links']
         return {}
     
-    def parse_vinted_url(self, url):
-        """Estrae i parametri dalla URL di Vinted"""
-        parsed = urlparse(url)
-        params = parse_qs(parsed.query)
+    def extract_json_from_html(self, html):
+        """Estrae dati JSON embedded nell'HTML"""
+        items = []
         
-        # Converti liste in valori singoli
-        clean_params = {}
-        for key, value in params.items():
-            if isinstance(value, list) and len(value) > 0:
-                clean_params[key] = value[0]
-            else:
-                clean_params[key] = value
-        
-        return clean_params
-    
-    def fetch_vinted_items(self, url):
-        """Recupera gli articoli da Vinted usando l'API con token"""
         try:
-            logger.info(f"🔍 Fetching URL: {url[:100]}...")
+            soup = BeautifulSoup(html, 'html.parser')
             
-            # Ottieni token se non ce l'hai
-            if not self.token:
-                logger.info("🔑 Ottengo token di sessione...")
-                self._get_token()
+            # Metodo 1: Cerca script tags con JSON
+            scripts = soup.find_all('script')
+            logger.info(f"📜 Trovati {len(scripts)} script tags")
             
-            # Estrai parametri dalla URL
-            params = self.parse_vinted_url(url)
-            
-            # Costruisci URL API
-            api_url = f"{self.api_base}/catalog/items"
-            
-            # Parametri comuni
-            api_params = {
-                'page': '1',
-                'per_page': '20',
-                'order': 'newest_first',
-            }
-            
-            # Aggiungi parametri dalla ricerca originale
-            if 'search_text' in params:
-                api_params['search_text'] = params['search_text']
-            if 'catalog_ids' in params:
-                api_params['catalog_ids'] = params['catalog_ids']
-            if 'brand_ids' in params:
-                api_params['brand_ids[]'] = params['brand_ids']
-            if 'size_ids' in params:
-                api_params['size_ids[]'] = params['size_ids']
-            if 'price_from' in params:
-                api_params['price_from'] = params['price_from']
-            if 'price_to' in params:
-                api_params['price_to'] = params['price_to']
-            
-            logger.info(f"📡 API URL: {api_url}")
-            logger.info(f"📋 Parametri: {api_params}")
-            
-            # Fai la richiesta
-            response = self.session.get(api_url, params=api_params, timeout=15)
-            logger.info(f"📊 Status: {response.status_code}")
-            
-            if response.status_code == 401:
-                logger.warning("⚠️ Token scaduto, riprovo...")
-                self.token = None
-                self._get_token()
-                response = self.session.get(api_url, params=api_params, timeout=15)
-                logger.info(f"📊 Nuovo status: {response.status_code}")
-            
-            if response.status_code != 200:
-                logger.error(f"❌ HTTP {response.status_code}")
-                logger.error(f"Response: {response.text[:500]}")
+            for idx, script in enumerate(scripts):
+                if not script.string:
+                    continue
                 
-                # Se l'API non funziona, prova metodo alternativo
-                logger.info("🔄 Provo metodo alternativo (ricerca diretta)...")
-                return self._fetch_items_alternative(url, api_params)
-            
-            data = response.json()
-            
-            if 'items' not in data:
-                logger.warning("⚠️ Nessun campo 'items' nella risposta")
-                logger.info(f"Chiavi disponibili: {list(data.keys())}")
-                return self._fetch_items_alternative(url, api_params)
-            
-            items_data = data['items']
-            logger.info(f"📦 Trovati {len(items_data)} articoli")
-            
-            items = []
-            for item in items_data:
-                # Estrai foto
-                photo_url = None
-                if 'photo' in item and item['photo']:
-                    photo_url = item['photo'].get('url') or item['photo'].get('full_size_url')
+                script_text = script.string.strip()
                 
-                # Prezzo
-                price = '0'
-                currency = '€'
-                if 'price' in item:
-                    price = item['price']
-                if 'currency' in item:
-                    currency = item['currency']
+                # Cerca pattern comuni dove Vinted mette i dati
+                patterns = [
+                    r'window\.__INITIAL_STATE__\s*=\s*({.+?});',
+                    r'window\.__PRELOADED_STATE__\s*=\s*({.+?});',
+                    r'window\.__NUXT__\s*=\s*({.+?});',
+                    r'window\.__data\s*=\s*({.+?});',
+                    r'data:\s*({.+?"items":.+?})',
+                ]
                 
-                # URL articolo
-                item_url = item.get('url', f"https://www.vinted.it/items/{item['id']}")
-                if not item_url.startswith('http'):
-                    item_url = 'https://www.vinted.it' + item_url
-                
-                items.append({
-                    'id': str(item['id']),
-                    'title': item.get('title', 'Senza titolo'),
-                    'price': str(price),
-                    'currency': currency,
-                    'url': item_url,
-                    'photo': photo_url
-                })
+                for pattern in patterns:
+                    match = re.search(pattern, script_text, re.DOTALL)
+                    if match:
+                        try:
+                            json_str = match.group(1)
+                            # Pulisci il JSON
+                            json_str = json_str.replace('\n', '').replace('\r', '')
+                            
+                            data = json.loads(json_str)
+                            logger.info(f"✅ JSON trovato nel pattern: {pattern[:30]}")
+                            
+                            # Cerca items ricorsivamente
+                            found_items = self._find_items_recursive(data)
+                            if found_items:
+                                return found_items
+                        except:
+                            continue
             
-            logger.info(f"✅ Estratti {len(items)} articoli!")
-            return items
+            # Metodo 2: Cerca nell'HTML diretto (grid items)
+            logger.info("🔍 Provo metodo HTML diretto...")
+            
+            # Vinted usa classi tipo: feed-grid__item, item-box, ecc.
+            item_containers = soup.find_all(['div', 'article'], class_=re.compile(r'(item|card|product)', re.I))
+            logger.info(f"📦 Trovati {len(item_containers)} possibili container")
+            
+            for container in item_containers[:30]:  # Limita a 30
+                try:
+                    # Cerca ID articolo
+                    item_id = None
+                    if 'data-item-id' in container.attrs:
+                        item_id = container['data-item-id']
+                    elif container.get('id'):
+                        id_match = re.search(r'item[_-]?(\d+)', container['id'])
+                        if id_match:
+                            item_id = id_match.group(1)
+                    
+                    # Cerca link
+                    link_tag = container.find('a', href=re.compile(r'/items/\d+'))
+                    if link_tag and 'href' in link_tag.attrs:
+                        href = link_tag['href']
+                        if not item_id:
+                            id_match = re.search(r'/items/(\d+)', href)
+                            if id_match:
+                                item_id = id_match.group(1)
+                        
+                        url = href if href.startswith('http') else f"https://www.vinted.it{href}"
+                    else:
+                        continue
+                    
+                    if not item_id:
+                        continue
+                    
+                    # Cerca titolo
+                    title = "Articolo"
+                    title_tag = container.find(['h2', 'h3', 'p'], class_=re.compile(r'title|name', re.I))
+                    if title_tag:
+                        title = title_tag.get_text(strip=True)
+                    
+                    # Cerca prezzo
+                    price = "0"
+                    currency = "€"
+                    price_tag = container.find(class_=re.compile(r'price', re.I))
+                    if price_tag:
+                        price_text = price_tag.get_text(strip=True)
+                        price_match = re.search(r'([\d,\.]+)\s*([€$£])?', price_text)
+                        if price_match:
+                            price = price_match.group(1)
+                            if price_match.group(2):
+                                currency = price_match.group(2)
+                    
+                    # Cerca immagine
+                    photo = None
+                    img_tag = container.find('img')
+                    if img_tag and 'src' in img_tag.attrs:
+                        photo = img_tag['src']
+                    elif img_tag and 'data-src' in img_tag.attrs:
+                        photo = img_tag['data-src']
+                    
+                    items.append({
+                        'id': str(item_id),
+                        'title': title[:100],
+                        'price': price,
+                        'currency': currency,
+                        'url': url,
+                        'photo': photo
+                    })
+                    
+                except Exception as e:
+                    continue
+            
+            if items:
+                logger.info(f"✅ Estratti {len(items)} articoli dal HTML!")
+                return items[:20]
+            
+            logger.warning("❌ Nessun articolo trovato")
+            return []
             
         except Exception as e:
-            logger.error(f"❌ Errore: {str(e)}")
+            logger.error(f"❌ Errore parsing: {e}")
             import traceback
             logger.error(traceback.format_exc())
             return []
     
-    def _fetch_items_alternative(self, url, api_params):
-        """Metodo alternativo: costruisce URL di ricerca diretta"""
+    def _find_items_recursive(self, obj, depth=0, max_depth=15):
+        """Cerca array 'items' ricorsivamente"""
+        if depth > max_depth:
+            return None
+        
+        if isinstance(obj, dict):
+            # Cerca chiave 'items'
+            if 'items' in obj and isinstance(obj['items'], list) and len(obj['items']) > 0:
+                first = obj['items'][0]
+                if isinstance(first, dict) and 'id' in first:
+                    logger.info(f"✅ Trovato array items a profondità {depth}")
+                    return self._parse_items_array(obj['items'])
+            
+            # Cerca in tutte le chiavi
+            for key, value in obj.items():
+                result = self._find_items_recursive(value, depth + 1, max_depth)
+                if result:
+                    return result
+        
+        elif isinstance(obj, list):
+            for item in obj:
+                result = self._find_items_recursive(item, depth + 1, max_depth)
+                if result:
+                    return result
+        
+        return None
+    
+    def _parse_items_array(self, items_array):
+        """Parsea array di items in formato standard"""
+        parsed = []
+        
+        for item in items_array[:20]:
+            try:
+                if not isinstance(item, dict) or 'id' not in item:
+                    continue
+                
+                # ID
+                item_id = str(item['id'])
+                
+                # Titolo
+                title = item.get('title', 'Senza titolo')
+                
+                # Prezzo
+                price = str(item.get('price', '0'))
+                currency = item.get('currency', '€')
+                
+                # URL
+                url = item.get('url', f"https://www.vinted.it/items/{item_id}")
+                if not url.startswith('http'):
+                    url = 'https://www.vinted.it' + url
+                
+                # Foto
+                photo = None
+                if 'photo' in item and item['photo']:
+                    if isinstance(item['photo'], dict):
+                        photo = item['photo'].get('url') or item['photo'].get('full_size_url')
+                    elif isinstance(item['photo'], str):
+                        photo = item['photo']
+                
+                if 'photos' in item and item['photos'] and len(item['photos']) > 0:
+                    first_photo = item['photos'][0]
+                    if isinstance(first_photo, dict):
+                        photo = first_photo.get('url') or first_photo.get('full_size_url')
+                
+                parsed.append({
+                    'id': item_id,
+                    'title': title,
+                    'price': price,
+                    'currency': currency,
+                    'url': url,
+                    'photo': photo
+                })
+            except:
+                continue
+        
+        return parsed
+    
+    def fetch_vinted_items(self, url):
+        """Recupera articoli da Vinted"""
         try:
-            logger.info("🔄 Uso metodo alternativo...")
+            logger.info(f"🔍 Fetching: {url[:100]}")
             
-            # Costruisci URL di ricerca diretta
-            search_url = "https://www.vinted.it/vetrina/nuovi"
+            # Assicurati che l'URL sia corretto
+            if not url.startswith('http'):
+                url = 'https://' + url
             
-            if 'search_text' in api_params:
-                search_url = f"https://www.vinted.it/vetrina?search_text={api_params['search_text']}"
+            response = self.session.get(url, timeout=20, allow_redirects=True)
+            logger.info(f"📊 Status: {response.status_code}")
             
-            logger.info(f"📡 URL alternativo: {search_url}")
+            if response.status_code != 200:
+                logger.error(f"❌ HTTP {response.status_code}")
+                return []
             
-            # Per ora ritorna una lista vuota, ma indica che il link è valido
-            # In futuro si può implementare scraping leggero
-            logger.warning("⚠️ Metodo alternativo non ancora implementato completamente")
+            # Salva HTML per debug (prime 1000 chars)
+            logger.info(f"📄 HTML preview: {response.text[:200]}")
             
+            items = self.extract_json_from_html(response.text)
+            
+            if items:
+                logger.info(f"✅ Trovati {len(items)} articoli!")
+                for i, item in enumerate(items[:3], 1):
+                    logger.info(f"  {i}. {item['title'][:40]} - {item['price']}{item['currency']}")
+            else:
+                logger.warning("⚠️ Nessun articolo estratto")
+            
+            return items
+            
+        except requests.RequestException as e:
+            logger.error(f"❌ Errore connessione: {e}")
             return []
-            
         except Exception as e:
-            logger.error(f"❌ Errore metodo alternativo: {e}")
+            logger.error(f"❌ Errore generale: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
             return []
     
     def check_new_items(self, user_id, link_id):
-        """Controlla nuovi articoli"""
         user_id = str(user_id)
         if user_id not in self.data['users']:
             return []
@@ -271,15 +337,13 @@ class VintedMonitor:
         if not link_data:
             return []
         
-        logger.info(f"🔍 Controllo link #{link_id}: {link_data['name']}")
+        logger.info(f"🔍 Controllo #{link_id}: {link_data['name']}")
         
         current_items = self.fetch_vinted_items(link_data['url'])
         
         if not current_items:
-            logger.warning(f"⚠️ Nessun articolo trovato")
+            logger.warning("⚠️ Nessun articolo")
             return []
-        
-        logger.info(f"📦 Articoli trovati: {len(current_items)}")
         
         current_ids = {item['id'] for item in current_items}
         last_ids = {item['id'] for item in link_data['last_items']}
@@ -288,11 +352,7 @@ class VintedMonitor:
         new_items = [item for item in current_items if item['id'] in new_item_ids]
         
         if new_items:
-            logger.info(f"🆕 {len(new_items)} nuovi articoli!")
-            for item in new_items:
-                logger.info(f"   - {item['title'][:50]}")
-        else:
-            logger.info("✅ Nessun nuovo articolo")
+            logger.info(f"🆕 {len(new_items)} nuovi!")
         
         link_data['last_items'] = current_items
         link_data['last_check'] = datetime.now().isoformat()
@@ -303,194 +363,143 @@ class VintedMonitor:
 monitor = VintedMonitor()
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    welcome_message = (
-        "🎉 <b>Benvenuto nel Bot Vinted Notifier!</b> 🎉\n\n"
-        "👋 Ciao! Monitoro Vinted per te.\n\n"
-        "📋 <b>Comandi:</b>\n\n"
-        "/aggiungi - Aggiungi link ricerca\n"
+    await update.message.reply_text(
+        "🎉 <b>Bot Vinted Notifier</b>\n\n"
+        "📋 Comandi:\n"
+        "/aggiungi - Aggiungi link\n"
         "/lista - I tuoi link\n"
-        "/rimuovi - Rimuovi link\n"
-        "/test - Test immediato\n\n"
-        "💡 <b>Come funziona:</b>\n"
-        "1. Cerca su Vinted\n"
-        "2. Copia il link\n"
-        "3. Usa /aggiungi\n"
-        "4. Ricevi notifiche! 🔔\n\n"
-        "⏱️ Controllo ogni 5 minuti.\n\n"
-        "⚠️ <b>NOTA:</b> A causa delle protezioni di Vinted,\n"
-        "il bot potrebbe non funzionare sempre perfettamente.\n"
-        "Usa /test per verificare se il link funziona."
+        "/test - Test\n"
+        "/rimuovi - Rimuovi\n\n"
+        "Inviami un link Vinted!",
+        parse_mode='HTML'
     )
-    await update.message.reply_text(welcome_message, parse_mode='HTML')
-
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await start(update, context)
 
 async def aggiungi(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    message = (
-        "🔗 <b>Aggiungi link Vinted</b>\n\n"
-        "Inviami il link tipo:\n"
-        "<code>https://www.vinted.it/catalog?search_text=nike Nike</code>\n\n"
-        "⚠️ Il bot tenterà di monitorarlo ma Vinted\n"
-        "potrebbe bloccare alcune richieste."
+    await update.message.reply_text(
+        "🔗 Inviami il link tipo:\n"
+        "<code>https://www.vinted.it/catalog?search_text=nike Nike</code>",
+        parse_mode='HTML'
     )
-    await update.message.reply_text(message, parse_mode='HTML')
 
 async def lista(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    links = monitor.get_user_links(user_id)
-    
-    if not links:
-        await update.message.reply_text("📭 Nessun link. Usa /aggiungi! 🚀", parse_mode='HTML')
-        return
-    
-    message = "📋 <b>I tuoi link:</b>\n\n"
-    
-    for link_id, link_data in links.items():
-        num_items = len(link_data.get('last_items', []))
-        last_check = link_data.get('last_check', 'Mai')
-        if last_check != 'Mai':
-            last_check = last_check[:16].replace('T', ' ')
-        
-        message += (
-            f"🔹 <b>#{link_id}</b> - {link_data['name']}\n"
-            f"   📦 Articoli: {num_items}\n"
-            f"   🕐 Ultimo: {last_check}\n\n"
-        )
-    
-    keyboard = [[InlineKeyboardButton("🗑️ Rimuovi", callback_data='remove_link')]]
-    await update.message.reply_text(message, parse_mode='HTML', reply_markup=InlineKeyboardMarkup(keyboard))
-
-async def test_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    links = monitor.get_user_links(user_id)
+    links = monitor.get_user_links(update.effective_user.id)
     
     if not links:
         await update.message.reply_text("📭 Nessun link. Usa /aggiungi!")
         return
     
-    await update.message.reply_text("🔍 Sto testando...")
+    msg = "📋 <b>Link:</b>\n\n"
+    for lid, data in links.items():
+        msg += f"🔹 #{lid} - {data['name']}\n   📦 {len(data.get('last_items', []))} articoli\n\n"
     
-    for link_id, link_data in links.items():
-        items = monitor.fetch_vinted_items(link_data['url'])
+    await update.message.reply_text(msg, parse_mode='HTML')
+
+async def test_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    links = monitor.get_user_links(update.effective_user.id)
+    
+    if not links:
+        await update.message.reply_text("📭 Nessun link!")
+        return
+    
+    await update.message.reply_text("🔍 Testing...")
+    
+    for lid, data in links.items():
+        items = monitor.fetch_vinted_items(data['url'])
         
         if items:
-            msg = f"✅ <b>{link_data['name']}</b>\n\n{len(items)} articoli!\n\n"
+            msg = f"✅ <b>{data['name']}</b>\n\n{len(items)} articoli:\n"
             for i, item in enumerate(items[:3], 1):
-                msg += f"{i}. {item['title'][:35]}... - {item['price']}{item['currency']}\n"
+                msg += f"{i}. {item['title'][:30]}... - {item['price']}{item['currency']}\n"
         else:
-            msg = f"⚠️ <b>{link_data['name']}</b>\n\nNessun articolo (Vinted potrebbe bloccare)"
+            msg = f"⚠️ <b>{data['name']}</b>\n\nNessun articolo trovato"
         
         await update.message.reply_text(msg, parse_mode='HTML')
         await asyncio.sleep(2)
 
 async def rimuovi(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    links = monitor.get_user_links(user_id)
+    links = monitor.get_user_links(update.effective_user.id)
     
     if not links:
-        await update.message.reply_text("📭 Nessun link.")
+        await update.message.reply_text("📭 Nessun link")
         return
     
-    keyboard = []
-    for link_id, link_data in links.items():
-        keyboard.append([InlineKeyboardButton(f"🗑️ {link_data['name']}", callback_data=f'remove_{link_id}')])
-    keyboard.append([InlineKeyboardButton("❌ Annulla", callback_data='cancel')])
+    kb = [[InlineKeyboardButton(f"🗑️ {d['name']}", callback_data=f'remove_{lid}')] for lid, d in links.items()]
+    kb.append([InlineKeyboardButton("❌ Annulla", callback_data='cancel')])
     
-    await update.message.reply_text("🗑️ Seleziona:", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
+    await update.message.reply_text("Seleziona:", reply_markup=InlineKeyboardMarkup(kb))
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
     
-    if 'vinted.it' in text.lower() or 'vinted.com' in text.lower():
+    if 'vinted' in text.lower():
         parts = text.split(' ', 1)
         url = parts[0]
         name = parts[1] if len(parts) > 1 else "Ricerca"
         
         await update.message.reply_text("🔍 Verifico...")
         
-        test_items = monitor.fetch_vinted_items(url)
+        items = monitor.fetch_vinted_items(url)
+        link_id = monitor.add_user_link(update.effective_user.id, url, name)
         
-        user_id = update.effective_user.id
-        link_id = monitor.add_user_link(user_id, url, name)
-        
-        if test_items:
-            msg = f"✅ <b>Link aggiunto!</b>\n\n🏷️ {name}\n🆔 #{link_id}\n📦 {len(test_items)} articoli\n\n🔔 Ti avviserò!"
+        if items:
+            await update.message.reply_text(
+                f"✅ Link aggiunto!\n\n🏷️ {name}\n🆔 #{link_id}\n📦 {len(items)} articoli",
+                parse_mode='HTML'
+            )
         else:
-            msg = f"⚠️ <b>Link aggiunto</b>\n\n🏷️ {name}\n🆔 #{link_id}\n\n⚠️ Nessun articolo trovato ora.\nVinted potrebbe bloccare le richieste.\nProva /test più tardi!"
-        
-        await update.message.reply_text(msg, parse_mode='HTML')
-    else:
-        await update.message.reply_text("❌ Link non valido. Usa /aggiungi!")
+            await update.message.reply_text(
+                f"⚠️ Link aggiunto ma nessun articolo trovato.\n\n🏷️ {name}\n🆔 #{link_id}\n\nProva /test più tardi!",
+                parse_mode='HTML'
+            )
 
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     
     if query.data == 'cancel':
-        await query.edit_message_text("❌ Annullato.")
+        await query.edit_message_text("❌ Annullato")
         return
     
     if query.data.startswith('remove_'):
-        link_id = query.data.replace('remove_', '')
-        user_id = query.from_user.id
-        
-        if monitor.remove_user_link(user_id, link_id):
-            await query.edit_message_text("✅ <b>Link rimosso!</b>", parse_mode='HTML')
-        else:
-            await query.edit_message_text("❌ Errore.")
+        lid = query.data.replace('remove_', '')
+        if monitor.remove_user_link(query.from_user.id, lid):
+            await query.edit_message_text("✅ Rimosso!", parse_mode='HTML')
 
 async def check_updates(context: ContextTypes.DEFAULT_TYPE):
-    logger.info("🔍 CONTROLLO PERIODICO")
+    logger.info("🔍 CONTROLLO")
     
-    for user_id, user_data in monitor.data['users'].items():
-        for link_id, link_data in user_data['links'].items():
+    for uid, udata in monitor.data['users'].items():
+        for lid, ldata in udata['links'].items():
             try:
-                new_items = monitor.check_new_items(user_id, link_id)
+                new = monitor.check_new_items(uid, lid)
                 
-                for item in new_items:
-                    message = (
-                        f"🆕 <b>Nuovo!</b>\n\n"
-                        f"🏷️ <b>{item['title']}</b>\n"
-                        f"💰 {item['price']} {item['currency']}\n"
-                        f"🔗 <a href='{item['url']}'>Vedi</a>\n\n"
-                        f"📋 {link_data['name']}"
-                    )
+                for item in new:
+                    msg = f"🆕 <b>{item['title']}</b>\n💰 {item['price']}{item['currency']}\n🔗 <a href='{item['url']}'>Vedi</a>"
                     
                     try:
                         if item['photo']:
-                            await context.bot.send_photo(
-                                chat_id=int(user_id),
-                                photo=item['photo'],
-                                caption=message,
-                                parse_mode='HTML'
-                            )
+                            await context.bot.send_photo(int(uid), item['photo'], caption=msg, parse_mode='HTML')
                         else:
-                            await context.bot.send_message(
-                                chat_id=int(user_id),
-                                text=message,
-                                parse_mode='HTML'
-                            )
-                    except Exception as e:
-                        logger.error(f"❌ Notifica: {e}")
+                            await context.bot.send_message(int(uid), msg, parse_mode='HTML')
+                    except:
+                        pass
                 
                 await asyncio.sleep(3)
-            except Exception as e:
-                logger.error(f"❌ Controllo: {e}")
+            except:
+                pass
     
-    logger.info("✅ COMPLETATO\n")
+    logger.info("✅ FATTO")
 
 def main():
     TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
     
     if not TOKEN:
-        logger.error("❌ TOKEN mancante!")
+        logger.error("❌ TOKEN!")
         return
     
     app = Application.builder().token(TOKEN).build()
     
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("aggiungi", aggiungi))
     app.add_handler(CommandHandler("lista", lista))
     app.add_handler(CommandHandler("test", test_link))
@@ -500,7 +509,7 @@ def main():
     
     app.job_queue.run_repeating(check_updates, interval=300, first=10)
     
-    logger.info("🚀 BOT VINTED AVVIATO!")
+    logger.info("🚀 BOT VINTED SCRAPER AVVIATO!")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == '__main__':
