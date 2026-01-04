@@ -20,7 +20,7 @@ DATA_FILE = 'vinted_data.json'
 # Inserisci qui gli ID Telegram degli utenti autorizzati
 # Per trovare il tuo ID: scrivi al bot @userinfobot su Telegram
 ALLOWED_USER_IDS = [
-    123456789,  # Sostituisci con il tuo ID
+    745047719,  # Sostituisci con il tuo ID
     987654321,  # Aggiungi altri ID se necessario
 ]
 # ========================================
