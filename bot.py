@@ -135,94 +135,109 @@ class VintedMonitor:
                 if not script.string:
                     continue
                 
-                script_content = script.string
+                script_content = script.string.strip()
                 
-                if 'items' in script_content or 'catalog' in script_content:
-                    logger.info(f"🎯 Script #{idx} potenzialmente utile")
+                # Cerca solo script che iniziano con window.__
+                if not script_content.startswith('window.__'):
+                    continue
                 
-                patterns = [
-                    (r'window\.__INITIAL_STATE__\s*=\s*(\{.+?\});', 'INITIAL_STATE'),
-                    (r'window\.__PRELOADED_STATE__\s*=\s*(\{.+?\});', 'PRELOADED_STATE'),
-                ]
+                logger.info(f"🎯 Script #{idx} inizia con window.__ - analizzo")
                 
-                for pattern, pattern_name in patterns:
-                    matches = re.findall(pattern, script_content, re.DOTALL)
+                # Cerca il nome della variabile
+                var_match = re.match(r'window\.__(\w+)__\s*=\s*', script_content)
+                if not var_match:
+                    continue
+                
+                var_name = var_match.group(1)
+                logger.info(f"📦 Variabile trovata: window.__{var_name}__")
+                
+                # Estrai tutto dopo l'uguale fino al punto e virgola finale
+                try:
+                    # Trova la posizione del primo '{'
+                    start_pos = script_content.index('{')
+                    # Prendi tutto da lì fino alla fine (meno eventuale ;)
+                    json_str = script_content[start_pos:].rstrip(';').strip()
                     
-                    if matches:
-                        logger.info(f"✅ Pattern '{pattern_name}' trovato!")
+                    logger.info(f"🔄 Tento parsing JSON (lunghezza: {len(json_str)} char)...")
                     
-                    for match in matches:
-                        try:
-                            json_str = match.strip()
-                            if json_str.endswith(';'):
-                                json_str = json_str[:-1]
-                            
-                            data = json.loads(json_str)
-                            logger.info(f"📦 JSON parsato! Chiavi top: {list(data.keys())[:5]}")
-                            
-                            items_data = None
-                            
-                            if 'catalog' in data and isinstance(data['catalog'], dict):
-                                if 'items' in data['catalog']:
-                                    items_data = data['catalog']['items']
-                                    logger.info(f"✅ Trovati items in catalog.items")
-                            
-                            if not items_data and 'items' in data:
-                                items_data = data['items']
-                                logger.info(f"✅ Trovati items diretti")
-                            
-                            if not items_data:
-                                logger.info("🔍 Cerco items ricorsivamente...")
-                                items_data = self.find_items_recursive(data)
-                                if items_data:
-                                    logger.info(f"✅ Trovati items ricorsivamente!")
-                            
-                            if items_data and isinstance(items_data, list) and len(items_data) > 0:
-                                logger.info(f"📦 Processando {len(items_data)} items...")
-                                for item in items_data:
-                                    if not isinstance(item, dict):
-                                        continue
-                                    
-                                    item_id = item.get('id')
-                                    if not item_id:
-                                        continue
-                                    
-                                    photo_url = None
-                                    if 'photo' in item and item['photo']:
-                                        if isinstance(item['photo'], dict):
-                                            photo_url = item['photo'].get('url') or item['photo'].get('full_size_url')
-                                    
-                                    if 'photos' in item and item['photos'] and len(item['photos']) > 0:
-                                        first_photo = item['photos'][0]
-                                        if isinstance(first_photo, dict):
-                                            photo_url = first_photo.get('url') or first_photo.get('full_size_url')
-                                    
-                                    item_url = item.get('url', f"https://www.vinted.it/items/{item_id}")
-                                    if not item_url.startswith('http'):
-                                        item_url = 'https://www.vinted.it' + item_url
-                                    
-                                    items.append({
-                                        'id': str(item_id),
-                                        'title': item.get('title', 'Senza titolo'),
-                                        'price': str(item.get('price', '0')),
-                                        'currency': item.get('currency', '€'),
-                                        'url': item_url,
-                                        'photo': photo_url
-                                    })
-                                
-                                if items:
-                                    logger.info(f"✅ Estratti {len(items)} articoli!")
-                                    return items[:20]
+                    # Prova a parsare
+                    data = json.loads(json_str)
+                    logger.info(f"✅ JSON parsato! Chiavi top: {list(data.keys())[:10]}")
+                    
+                    # Cerca items
+                    items_data = None
+                    
+                    # Metodo 1: catalog.items
+                    if 'catalog' in data and isinstance(data['catalog'], dict):
+                        if 'items' in data['catalog']:
+                            items_data = data['catalog']['items']
+                            logger.info(f"✅ Trovati {len(items_data)} items in catalog.items")
+                    
+                    # Metodo 2: items diretti
+                    if not items_data and 'items' in data:
+                        items_data = data['items']
+                        logger.info(f"✅ Trovati {len(items_data)} items diretti")
+                    
+                    # Metodo 3: ricerca ricorsiva
+                    if not items_data:
+                        logger.info("🔍 Cerco items ricorsivamente...")
+                        items_data = self.find_items_recursive(data)
+                        if items_data:
+                            logger.info(f"✅ Trovati {len(items_data)} items ricorsivamente!")
+                    
+                    if items_data and isinstance(items_data, list) and len(items_data) > 0:
+                        logger.info(f"📦 Processando {len(items_data)} items...")
                         
-                        except json.JSONDecodeError as e:
-                            logger.warning(f"⚠️ JSON decode error: {str(e)[:100]}")
-                            continue
-                        except Exception as e:
-                            logger.error(f"⚠️ Errore parsing: {str(e)[:100]}")
-                            continue
+                        for item in items_data:
+                            if not isinstance(item, dict):
+                                continue
+                            
+                            item_id = item.get('id')
+                            if not item_id:
+                                continue
+                            
+                            # Estrai foto
+                            photo_url = None
+                            if 'photo' in item and item['photo']:
+                                if isinstance(item['photo'], dict):
+                                    photo_url = item['photo'].get('url') or item['photo'].get('full_size_url')
+                            
+                            if 'photos' in item and item['photos'] and len(item['photos']) > 0:
+                                first_photo = item['photos'][0]
+                                if isinstance(first_photo, dict):
+                                    photo_url = first_photo.get('url') or first_photo.get('full_size_url')
+                            
+                            # URL articolo
+                            item_url = item.get('url', f"https://www.vinted.it/items/{item_id}")
+                            if not item_url.startswith('http'):
+                                item_url = 'https://www.vinted.it' + item_url
+                            
+                            items.append({
+                                'id': str(item_id),
+                                'title': item.get('title', 'Senza titolo'),
+                                'price': str(item.get('price', '0')),
+                                'currency': item.get('currency', '€'),
+                                'url': item_url,
+                                'photo': photo_url
+                            })
+                        
+                        if items:
+                            logger.info(f"✅ Estratti {len(items)} articoli totali!")
+                            return items[:20]
+                
+                except ValueError as e:
+                    logger.warning(f"⚠️ Errore nel trovare {{ nell'script")
+                    continue
+                except json.JSONDecodeError as e:
+                    logger.warning(f"⚠️ JSON decode error: {str(e)[:100]}")
+                    continue
+                except Exception as e:
+                    logger.error(f"⚠️ Errore: {str(e)[:100]}")
+                    continue
             
             if not items:
-                logger.warning("❌ Nessun articolo estratto")
+                logger.warning("❌ Nessun articolo estratto da tutti gli script")
+                logger.info("💡 Vinted potrebbe aver cambiato la struttura della pagina")
             
             return items
             
