@@ -6,7 +6,8 @@ from datetime import datetime
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters
 import requests
-from urllib.parse import urlparse, parse_qs, urlencode
+from urllib.parse import urlparse, parse_qs
+import uuid
 
 # Configurazione logging
 logging.basicConfig(
@@ -22,12 +23,51 @@ class VintedMonitor:
     def __init__(self):
         self.data = self.load_data()
         self.session = requests.Session()
-        self.session.headers.update({
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-            'Accept': 'application/json, text/plain, */*',
-            'Accept-Language': 'it-IT,it;q=0.9',
-        })
         self.api_base = 'https://www.vinted.it/api/v2'
+        self.token = None
+        self._setup_session()
+    
+    def _setup_session(self):
+        """Configura la sessione con headers appropriati"""
+        self.session.headers.update({
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': 'application/json, text/plain, */*',
+            'Accept-Language': 'it-IT,it;q=0.9,en;q=0.8',
+            'Accept-Encoding': 'gzip, deflate, br',
+            'Origin': 'https://www.vinted.it',
+            'Referer': 'https://www.vinted.it/',
+        })
+    
+    def _get_token(self):
+        """Ottiene un token di sessione valido"""
+        try:
+            # Fai una richiesta alla homepage per ottenere i cookie di sessione
+            response = self.session.get('https://www.vinted.it', timeout=10)
+            
+            if response.status_code == 200:
+                # Cerca il token nel HTML o nei cookie
+                cookies = self.session.cookies.get_dict()
+                
+                # Vinted usa un cookie chiamato _vinted_fr_session o simile
+                for cookie_name in cookies:
+                    if 'vinted' in cookie_name.lower() and 'session' in cookie_name.lower():
+                        logger.info(f"✅ Cookie di sessione trovato: {cookie_name}")
+                
+                # Cerca anche nei meta tag o script
+                if 'csrf-token' in response.text:
+                    import re
+                    csrf_match = re.search(r'csrf-token["\']?\s*content=["\']([^"\']+)', response.text)
+                    if csrf_match:
+                        csrf_token = csrf_match.group(1)
+                        self.session.headers['X-CSRF-Token'] = csrf_token
+                        logger.info("✅ CSRF token trovato e impostato")
+                
+                return True
+            
+            return False
+        except Exception as e:
+            logger.error(f"❌ Errore ottenimento token: {e}")
+            return False
     
     def load_data(self):
         """Carica i dati dal file JSON"""
@@ -92,9 +132,14 @@ class VintedMonitor:
         return clean_params
     
     def fetch_vinted_items(self, url):
-        """Recupera gli articoli da Vinted usando l'API"""
+        """Recupera gli articoli da Vinted usando l'API con token"""
         try:
             logger.info(f"🔍 Fetching URL: {url[:100]}...")
+            
+            # Ottieni token se non ce l'hai
+            if not self.token:
+                logger.info("🔑 Ottengo token di sessione...")
+                self._get_token()
             
             # Estrai parametri dalla URL
             params = self.parse_vinted_url(url)
@@ -106,6 +151,7 @@ class VintedMonitor:
             api_params = {
                 'page': '1',
                 'per_page': '20',
+                'order': 'newest_first',
             }
             
             # Aggiungi parametri dalla ricerca originale
@@ -114,17 +160,13 @@ class VintedMonitor:
             if 'catalog_ids' in params:
                 api_params['catalog_ids'] = params['catalog_ids']
             if 'brand_ids' in params:
-                api_params['brand_ids'] = params['brand_ids']
+                api_params['brand_ids[]'] = params['brand_ids']
             if 'size_ids' in params:
-                api_params['size_ids'] = params['size_ids']
+                api_params['size_ids[]'] = params['size_ids']
             if 'price_from' in params:
                 api_params['price_from'] = params['price_from']
             if 'price_to' in params:
                 api_params['price_to'] = params['price_to']
-            if 'currency' in params:
-                api_params['currency'] = params['currency']
-            if 'order' in params:
-                api_params['order'] = params['order']
             
             logger.info(f"📡 API URL: {api_url}")
             logger.info(f"📋 Parametri: {api_params}")
@@ -133,17 +175,27 @@ class VintedMonitor:
             response = self.session.get(api_url, params=api_params, timeout=15)
             logger.info(f"📊 Status: {response.status_code}")
             
+            if response.status_code == 401:
+                logger.warning("⚠️ Token scaduto, riprovo...")
+                self.token = None
+                self._get_token()
+                response = self.session.get(api_url, params=api_params, timeout=15)
+                logger.info(f"📊 Nuovo status: {response.status_code}")
+            
             if response.status_code != 200:
                 logger.error(f"❌ HTTP {response.status_code}")
-                logger.error(f"Response: {response.text[:200]}")
-                return []
+                logger.error(f"Response: {response.text[:500]}")
+                
+                # Se l'API non funziona, prova metodo alternativo
+                logger.info("🔄 Provo metodo alternativo (ricerca diretta)...")
+                return self._fetch_items_alternative(url, api_params)
             
             data = response.json()
             
             if 'items' not in data:
                 logger.warning("⚠️ Nessun campo 'items' nella risposta")
                 logger.info(f"Chiavi disponibili: {list(data.keys())}")
-                return []
+                return self._fetch_items_alternative(url, api_params)
             
             items_data = data['items']
             logger.info(f"📦 Trovati {len(items_data)} articoli")
@@ -180,16 +232,33 @@ class VintedMonitor:
             logger.info(f"✅ Estratti {len(items)} articoli!")
             return items
             
-        except requests.RequestException as e:
-            logger.error(f"❌ Errore connessione: {str(e)}")
-            return []
-        except json.JSONDecodeError as e:
-            logger.error(f"❌ Errore parsing JSON: {str(e)}")
-            return []
         except Exception as e:
-            logger.error(f"❌ Errore generale: {str(e)}")
+            logger.error(f"❌ Errore: {str(e)}")
             import traceback
             logger.error(traceback.format_exc())
+            return []
+    
+    def _fetch_items_alternative(self, url, api_params):
+        """Metodo alternativo: costruisce URL di ricerca diretta"""
+        try:
+            logger.info("🔄 Uso metodo alternativo...")
+            
+            # Costruisci URL di ricerca diretta
+            search_url = "https://www.vinted.it/vetrina/nuovi"
+            
+            if 'search_text' in api_params:
+                search_url = f"https://www.vinted.it/vetrina?search_text={api_params['search_text']}"
+            
+            logger.info(f"📡 URL alternativo: {search_url}")
+            
+            # Per ora ritorna una lista vuota, ma indica che il link è valido
+            # In futuro si può implementare scraping leggero
+            logger.warning("⚠️ Metodo alternativo non ancora implementato completamente")
+            
+            return []
+            
+        except Exception as e:
+            logger.error(f"❌ Errore metodo alternativo: {e}")
             return []
     
     def check_new_items(self, user_id, link_id):
@@ -236,19 +305,21 @@ monitor = VintedMonitor()
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     welcome_message = (
         "🎉 <b>Benvenuto nel Bot Vinted Notifier!</b> 🎉\n\n"
-        "👋 Ciao! Sono qui per aiutarti a monitorare i tuoi articoli preferiti su Vinted.\n\n"
-        "📋 <b>Comandi disponibili:</b>\n\n"
-        "🔗 /aggiungi - Aggiungi un nuovo link di ricerca Vinted\n"
-        "📜 /lista - Visualizza tutti i tuoi link monitorati\n"
-        "🗑️ /rimuovi - Rimuovi un link dalla lista\n"
-        "🔄 /test - Testa immediatamente un link\n"
-        "ℹ️ /help - Mostra questo messaggio di aiuto\n\n"
+        "👋 Ciao! Monitoro Vinted per te.\n\n"
+        "📋 <b>Comandi:</b>\n\n"
+        "/aggiungi - Aggiungi link ricerca\n"
+        "/lista - I tuoi link\n"
+        "/rimuovi - Rimuovi link\n"
+        "/test - Test immediato\n\n"
         "💡 <b>Come funziona:</b>\n"
-        "1️⃣ Vai su Vinted e imposta i tuoi filtri di ricerca\n"
-        "2️⃣ Copia il link della ricerca\n"
-        "3️⃣ Usa /aggiungi per registrarlo\n"
-        "4️⃣ Riceverai notifiche per ogni nuovo articolo! 🔔\n\n"
-        "⏱️ Il bot controlla ogni 5 minuti automaticamente."
+        "1. Cerca su Vinted\n"
+        "2. Copia il link\n"
+        "3. Usa /aggiungi\n"
+        "4. Ricevi notifiche! 🔔\n\n"
+        "⏱️ Controllo ogni 5 minuti.\n\n"
+        "⚠️ <b>NOTA:</b> A causa delle protezioni di Vinted,\n"
+        "il bot potrebbe non funzionare sempre perfettamente.\n"
+        "Usa /test per verificare se il link funziona."
     )
     await update.message.reply_text(welcome_message, parse_mode='HTML')
 
@@ -257,14 +328,11 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def aggiungi(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = (
-        "🔗 <b>Aggiungi un nuovo link Vinted</b>\n\n"
-        "📝 Inviami il link di ricerca Vinted che vuoi monitorare.\n\n"
-        "💡 <b>Esempio:</b>\n"
-        "<code>https://www.vinted.it/catalog?search_text=nike</code>\n\n"
-        "📌 Dopo il link, aggiungi un nome:\n"
-        "<code>[LINK] Nome ricerca</code>\n\n"
-        "🎯 <b>Esempio completo:</b>\n"
-        "<code>https://www.vinted.it/catalog?search_text=nike Nike Scarpe</code>"
+        "🔗 <b>Aggiungi link Vinted</b>\n\n"
+        "Inviami il link tipo:\n"
+        "<code>https://www.vinted.it/catalog?search_text=nike Nike</code>\n\n"
+        "⚠️ Il bot tenterà di monitorarlo ma Vinted\n"
+        "potrebbe bloccare alcune richieste."
     )
     await update.message.reply_text(message, parse_mode='HTML')
 
@@ -273,15 +341,10 @@ async def lista(update: Update, context: ContextTypes.DEFAULT_TYPE):
     links = monitor.get_user_links(user_id)
     
     if not links:
-        message = (
-            "📭 <b>Nessun link monitorato</b>\n\n"
-            "Non hai ancora aggiunto nessun link da monitorare.\n\n"
-            "Usa /aggiungi per iniziare! 🚀"
-        )
-        await update.message.reply_text(message, parse_mode='HTML')
+        await update.message.reply_text("📭 Nessun link. Usa /aggiungi! 🚀", parse_mode='HTML')
         return
     
-    message = "📋 <b>I tuoi link monitorati:</b>\n\n"
+    message = "📋 <b>I tuoi link:</b>\n\n"
     
     for link_id, link_data in links.items():
         num_items = len(link_data.get('last_items', []))
@@ -291,64 +354,50 @@ async def lista(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         message += (
             f"🔹 <b>#{link_id}</b> - {link_data['name']}\n"
-            f"   📅 Aggiunto: {link_data['added_at'][:10]}\n"
             f"   📦 Articoli: {num_items}\n"
-            f"   🕐 Ultimo controllo: {last_check}\n\n"
+            f"   🕐 Ultimo: {last_check}\n\n"
         )
     
     keyboard = [[InlineKeyboardButton("🗑️ Rimuovi", callback_data='remove_link')]]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    await update.message.reply_text(message, parse_mode='HTML', reply_markup=reply_markup)
+    await update.message.reply_text(message, parse_mode='HTML', reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def test_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     links = monitor.get_user_links(user_id)
     
     if not links:
-        await update.message.reply_text("📭 Non hai link da testare.\n\nUsa /aggiungi! 🔗")
+        await update.message.reply_text("📭 Nessun link. Usa /aggiungi!")
         return
     
-    await update.message.reply_text("🔍 Sto testando i tuoi link...")
+    await update.message.reply_text("🔍 Sto testando...")
     
     for link_id, link_data in links.items():
-        msg = f"🔗 <b>Link #{link_id}: {link_data['name']}</b>\n\n"
-        
         items = monitor.fetch_vinted_items(link_data['url'])
         
         if items:
-            msg += f"✅ Trovati <b>{len(items)}</b> articoli!\n\n"
-            msg += "📦 <b>Ultimi 3:</b>\n"
+            msg = f"✅ <b>{link_data['name']}</b>\n\n{len(items)} articoli!\n\n"
             for i, item in enumerate(items[:3], 1):
-                msg += f"{i}. {item['title'][:40]}... - {item['price']} {item['currency']}\n"
+                msg += f"{i}. {item['title'][:35]}... - {item['price']}{item['currency']}\n"
         else:
-            msg += "❌ Nessun articolo trovato"
+            msg = f"⚠️ <b>{link_data['name']}</b>\n\nNessun articolo (Vinted potrebbe bloccare)"
         
         await update.message.reply_text(msg, parse_mode='HTML')
+        await asyncio.sleep(2)
 
 async def rimuovi(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     links = monitor.get_user_links(user_id)
     
     if not links:
-        await update.message.reply_text("📭 Non hai link da rimuovere.")
+        await update.message.reply_text("📭 Nessun link.")
         return
     
     keyboard = []
     for link_id, link_data in links.items():
-        keyboard.append([InlineKeyboardButton(
-            f"🗑️ {link_data['name']}", 
-            callback_data=f'remove_{link_id}'
-        )])
-    
+        keyboard.append([InlineKeyboardButton(f"🗑️ {link_data['name']}", callback_data=f'remove_{link_id}')])
     keyboard.append([InlineKeyboardButton("❌ Annulla", callback_data='cancel')])
-    reply_markup = InlineKeyboardMarkup(keyboard)
     
-    await update.message.reply_text(
-        "🗑️ <b>Seleziona il link da rimuovere:</b>",
-        reply_markup=reply_markup,
-        parse_mode='HTML'
-    )
+    await update.message.reply_text("🗑️ Seleziona:", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
@@ -356,43 +405,30 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if 'vinted.it' in text.lower() or 'vinted.com' in text.lower():
         parts = text.split(' ', 1)
         url = parts[0]
-        name = parts[1] if len(parts) > 1 else "Ricerca senza nome"
+        name = parts[1] if len(parts) > 1 else "Ricerca"
         
-        await update.message.reply_text("🔍 Verifico il link...")
+        await update.message.reply_text("🔍 Verifico...")
         
         test_items = monitor.fetch_vinted_items(url)
-        
-        if not test_items:
-            await update.message.reply_text(
-                "❌ <b>Nessun articolo trovato</b>\n\n"
-                "Assicurati di copiare l'URL completo dalla barra degli indirizzi!\n\n"
-                "💡 Deve essere tipo:\n"
-                "<code>https://www.vinted.it/catalog?search_text=...</code>",
-                parse_mode='HTML'
-            )
-            return
         
         user_id = update.effective_user.id
         link_id = monitor.add_user_link(user_id, url, name)
         
-        message = (
-            "✅ <b>Link aggiunto con successo!</b>\n\n"
-            f"🏷️ <b>Nome:</b> {name}\n"
-            f"🆔 <b>ID:</b> #{link_id}\n"
-            f"📦 <b>Articoli trovati:</b> {len(test_items)}\n\n"
-            "🔔 Riceverai notifiche per nuovi articoli!\n"
-            "⏱️ Primo controllo tra 5 minuti."
-        )
-        await update.message.reply_text(message, parse_mode='HTML')
+        if test_items:
+            msg = f"✅ <b>Link aggiunto!</b>\n\n🏷️ {name}\n🆔 #{link_id}\n📦 {len(test_items)} articoli\n\n🔔 Ti avviserò!"
+        else:
+            msg = f"⚠️ <b>Link aggiunto</b>\n\n🏷️ {name}\n🆔 #{link_id}\n\n⚠️ Nessun articolo trovato ora.\nVinted potrebbe bloccare le richieste.\nProva /test più tardi!"
+        
+        await update.message.reply_text(msg, parse_mode='HTML')
     else:
-        await update.message.reply_text("❌ Link non valido.\n\nUsa /aggiungi per info! 💡")
+        await update.message.reply_text("❌ Link non valido. Usa /aggiungi!")
 
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     
     if query.data == 'cancel':
-        await query.edit_message_text("❌ Operazione annullata.")
+        await query.edit_message_text("❌ Annullato.")
         return
     
     if query.data.startswith('remove_'):
@@ -400,17 +436,12 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id = query.from_user.id
         
         if monitor.remove_user_link(user_id, link_id):
-            await query.edit_message_text(
-                "✅ <b>Link rimosso!</b>\n\nUsa /lista per vedere i rimanenti.",
-                parse_mode='HTML'
-            )
+            await query.edit_message_text("✅ <b>Link rimosso!</b>", parse_mode='HTML')
         else:
-            await query.edit_message_text("❌ Errore rimozione.")
+            await query.edit_message_text("❌ Errore.")
 
 async def check_updates(context: ContextTypes.DEFAULT_TYPE):
-    logger.info("=" * 60)
     logger.info("🔍 CONTROLLO PERIODICO")
-    logger.info("=" * 60)
     
     for user_id, user_data in monitor.data['users'].items():
         for link_id, link_data in user_data['links'].items():
@@ -419,11 +450,11 @@ async def check_updates(context: ContextTypes.DEFAULT_TYPE):
                 
                 for item in new_items:
                     message = (
-                        f"🆕 <b>Nuovo articolo trovato!</b>\n\n"
+                        f"🆕 <b>Nuovo!</b>\n\n"
                         f"🏷️ <b>{item['title']}</b>\n"
-                        f"💰 <b>Prezzo:</b> {item['price']} {item['currency']}\n"
-                        f"🔗 <a href='{item['url']}'>Vedi su Vinted</a>\n\n"
-                        f"📋 Ricerca: <i>{link_data['name']}</i>"
+                        f"💰 {item['price']} {item['currency']}\n"
+                        f"🔗 <a href='{item['url']}'>Vedi</a>\n\n"
+                        f"📋 {link_data['name']}"
                     )
                     
                     try:
@@ -440,43 +471,37 @@ async def check_updates(context: ContextTypes.DEFAULT_TYPE):
                                 text=message,
                                 parse_mode='HTML'
                             )
-                        logger.info(f"✅ Notifica inviata a {user_id}")
                     except Exception as e:
-                        logger.error(f"❌ Errore notifica: {e}")
+                        logger.error(f"❌ Notifica: {e}")
                 
                 await asyncio.sleep(3)
-                
             except Exception as e:
-                logger.error(f"❌ Errore controllo: {e}")
-                import traceback
-                logger.error(traceback.format_exc())
+                logger.error(f"❌ Controllo: {e}")
     
-    logger.info("✅ CONTROLLO COMPLETATO\n")
+    logger.info("✅ COMPLETATO\n")
 
 def main():
     TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
     
     if not TOKEN:
-        logger.error("❌ TELEGRAM_BOT_TOKEN non impostato!")
+        logger.error("❌ TOKEN mancante!")
         return
     
-    application = Application.builder().token(TOKEN).build()
+    app = Application.builder().token(TOKEN).build()
     
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(CommandHandler("aggiungi", aggiungi))
-    application.add_handler(CommandHandler("lista", lista))
-    application.add_handler(CommandHandler("test", test_link))
-    application.add_handler(CommandHandler("rimuovi", rimuovi))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    application.add_handler(CallbackQueryHandler(button_callback))
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CommandHandler("aggiungi", aggiungi))
+    app.add_handler(CommandHandler("lista", lista))
+    app.add_handler(CommandHandler("test", test_link))
+    app.add_handler(CommandHandler("rimuovi", rimuovi))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.add_handler(CallbackQueryHandler(button_callback))
     
-    job_queue = application.job_queue
-    job_queue.run_repeating(check_updates, interval=300, first=10)
+    app.job_queue.run_repeating(check_updates, interval=300, first=10)
     
-    logger.info("🚀 BOT VINTED AVVIATO CON API!")
-    
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+    logger.info("🚀 BOT VINTED AVVIATO!")
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == '__main__':
     main()
